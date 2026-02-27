@@ -412,6 +412,29 @@ def build_pdf_report(
     else:
         story.append(Paragraph("Sensitivity table not available.", styles["Body"]))
     story.append(Spacer(1, 12))
+    # --- Sensitivity Interpretation Section ---
+story.append(Paragraph("Sensitivity Interpretation", styles["H2x"]))
+story.append(Spacer(1, 6))
+
+story.append(Paragraph(
+    "The sensitivity analysis demonstrates that the RADCF pricing model "
+    "is most responsive to changes in Probability of Default (PD). "
+    "Because the fair installment formula divides by (1 − PD), increases "
+    "in default risk lead to non-linear increases in required repayments.",
+    styles["Body"]
+))
+
+story.append(Spacer(1, 6))
+
+story.append(Paragraph(
+    "Administrative cost and discount rate adjustments produce comparatively "
+    "smaller changes in fair pricing. This suggests that credit risk "
+    "assumptions are the dominant driver of hire-purchase pricing within "
+    "the RADCF framework.",
+    styles["Body"]
+))
+
+story.append(Spacer(1, 12))
 
     # 7. Conclusion
     story.append(Paragraph("7. Conclusion & Recommendation (Auto-generated)", styles["H2x"]))
