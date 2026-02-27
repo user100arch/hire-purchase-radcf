@@ -380,7 +380,6 @@ with tabs[0]:
             """
         )
 
-
 # ============================================================
 # TAB 2: Paste Contract Text (Auto-fill)
 # ============================================================
@@ -389,7 +388,7 @@ with tabs[1]:
     st.write("Paste a hire-purchase offer (WhatsApp message, advert text). The tool will attempt to extract contract terms and compute RADCF fair value.")
 
     sample = "Cash price: KSh 25000. Deposit 30%. Pay KES 2500 per month for 12 months. Admin fee 5%."
-    txt = st.text_area("Paste text here", value=sample, height=140)
+    txt = st.text_area("Paste text here", value=sample, height=140, key="txt_offer")
 
     extracted = extract_deal_fields(txt)
 
@@ -404,19 +403,22 @@ with tabs[1]:
             "Cash price (KSh)",
             min_value=0.0,
             value=float(extracted["cash_price"] or 25000.0),
-            step=500.0
+            step=500.0,
+            key="cp2"
         )
         n_months2 = st.number_input(
             "Repayment term (months)",
             min_value=1,
             value=int(extracted["term_months"] or 12),
-            step=1
+            step=1,
+            key="n2"
         )
         income2 = st.number_input(
             "Borrower monthly income (KSh)",
             min_value=0.0,
             value=30000.0,
-            step=1000.0
+            step=1000.0,
+            key="inc2"
         )
 
     with colY:
@@ -429,7 +431,8 @@ with tabs[1]:
             min_value=0.0,
             max_value=100.0,
             value=float(dep_pct_guess or 30.0),
-            step=1.0
+            step=1.0,
+            key="dp2"
         )
 
         admin_pct_guess = extracted["admin_pct"]
@@ -441,7 +444,8 @@ with tabs[1]:
             min_value=0.0,
             max_value=30.0,
             value=float(admin_pct_guess or 5.0),
-            step=0.5
+            step=0.5,
+            key="ad2"
         )
 
         r2 = st.number_input(
@@ -449,15 +453,16 @@ with tabs[1]:
             min_value=0.0,
             value=0.02,
             step=0.005,
-            format="%.3f"
+            format="%.3f",
+            key="r2"
         )
 
     st.markdown("**PD Model Parameters**")
     colP1, colP2 = st.columns(2)
     with colP1:
-        beta0_2 = st.number_input("β0", value=2.5, step=0.1, format="%.2f")
+        beta0_2 = st.number_input("β0", value=2.5, step=0.1, format="%.2f", key="b02")
     with colP2:
-        beta1_2 = st.number_input("β1", value=-0.4, step=0.05, format="%.2f")
+        beta1_2 = st.number_input("β1", value=-0.4, step=0.05, format="%.2f", key="b12")
 
     pd2 = logistic_pd(income2, beta0_2, beta1_2)
     res2 = fair_installment(cash_price2, deposit_pct2, admin2, int(n_months2), float(r2), pd2)
@@ -472,24 +477,23 @@ with tabs[1]:
     st.metric("Fair monthly installment (KSh)", f"{res2['fair_monthly_installment']:.2f}")
     st.metric("Fair total paid (deposit + installments) (KSh)", f"{res2['fair_total_paid_if_no_default']:.2f}")
 
-    # If extracted monthly installment exists, compare + implied APR
     if extracted["monthly_installment"] is not None:
         market_m = float(extracted["monthly_installment"])
         market_total = res2["deposit_amount"] + market_m * int(n_months2)
 
-        over_amt = market_total - res2["fair_total_paid_if_no_default"]
-        over_pct = (over_amt / res2["fair_total_paid_if_no_default"]) if res2["fair_total_paid_if_no_default"] > 0 else float("nan")
+        over_amt2 = market_total - res2["fair_total_paid_if_no_default"]
+        over_pct2 = (over_amt2 / res2["fair_total_paid_if_no_default"]) if res2["fair_total_paid_if_no_default"] > 0 else float("nan")
 
         st.divider()
         st.markdown("### Market Comparison (from extracted monthly installment)")
 
-        label2, explain2 = fairness_badge(over_pct)
-        fairness_score2 = max(0.0, min(100.0, 100.0 - (over_pct * 100.0)))
+        label2, explain2 = fairness_badge(over_pct2)
+        fairness_score2 = max(0.0, min(100.0, 100.0 - (over_pct2 * 100.0)))
 
         st.metric("Market monthly installment (KSh)", f"{market_m:.2f}")
         st.metric("Estimated market total paid (KSh)", f"{market_total:.2f}")
-        st.metric("Overpricing amount (KSh)", f"{over_amt:.2f}")
-        st.metric("Overpricing (%)", f"{over_pct*100:.2f}%")
+        st.metric("Overpricing amount (KSh)", f"{over_amt2:.2f}")
+        st.metric("Overpricing (%)", f"{over_pct2*100:.2f}%")
         st.metric("Fairness Score (0–100)", f"{fairness_score2:.1f}")
         st.caption(f"Assessment: **{label2}** — {explain2}")
 
