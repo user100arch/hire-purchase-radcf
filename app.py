@@ -10,14 +10,7 @@ import plotly.graph_objects as go
 
 # PDF (ReportLab)
 from reportlab.lib.pagesizes import A4
-from reportlab.platypus import (
-    SimpleDocTemplate,
-    Paragraph,
-    Spacer,
-    Table,
-    TableStyle,
-    PageBreak,
-)
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
@@ -26,10 +19,7 @@ from reportlab.lib import colors
 # Core actuarial/pricing functions
 # ============================================================
 def logistic_pd(income_ksh: float, beta0: float, beta1: float) -> float:
-    """
-    PD = 1 / (1 + exp(-(beta0 + beta1 * ln(income/100))))
-    Clamps to [0,1].
-    """
+    """PD = 1 / (1 + exp(-(beta0 + beta1 * ln(income/100))))"""
     if income_ksh <= 0:
         return 1.0
     x = math.log(income_ksh / 100.0)
@@ -39,10 +29,7 @@ def logistic_pd(income_ksh: float, beta0: float, beta1: float) -> float:
 
 
 def annuity_factor(r: float, n: int) -> float:
-    """
-    AF = (1 - (1+r)^-n) / r
-    If r == 0: AF = n
-    """
+    """AF = (1 - (1+r)^-n) / r ; if r==0 then AF=n"""
     if n <= 0:
         return 0.0
     if abs(r) < 1e-12:
@@ -56,10 +43,9 @@ def fair_installment(
     admin_cost_pct: float,
     n_months: int,
     r_monthly: float,
-    pd_est: float
+    pd_est: float,
 ) -> dict:
     """
-    Consistent with your draft:
     OP = cash_price
     Deposit = OP * deposit_pct
     Admin = OP * admin_cost_pct
@@ -67,22 +53,18 @@ def fair_installment(
     AF = annuity_factor(r, n)
     M = CF_revised / ((1 - PD) * AF)
 
-    Fair total assumes full payment (deposit + M*n)
-    RADCF PV is expected PV after default-risk adjustment:
-        PV = deposit + (M * AF * (1-PD))
+    Fair total (if fully paid) = deposit + M*n
+    RADCF PV (expected PV) = deposit + (M * AF * (1-PD))
     """
     op = float(cash_price)
     deposit = op * (deposit_pct / 100.0)
     admin_cost = op * (admin_cost_pct / 100.0)
     cf_revised = op + admin_cost - deposit
 
-    af = annuity_factor(r_monthly, int(n_months))
-    repay_prob = max(1e-9, (1.0 - float(pd_est)))  # avoid divide-by-zero
+    af = annuity_factor(float(r_monthly), int(n_months))
+    repay_prob = max(1e-9, (1.0 - float(pd_est)))  # avoid divide by zero
 
-    if af <= 0:
-        m = float("nan")
-    else:
-        m = cf_revised / (repay_prob * af)
+    m = float("nan") if af <= 0 else cf_revised / (repay_prob * af)
 
     fair_total = deposit + (m * n_months)
     radcf_pv = deposit + (m * af * repay_prob)
@@ -101,16 +83,13 @@ def fair_installment(
 
 
 def implied_monthly_rate_from_payment(P: float, payment: float, n: int) -> float:
-    """
-    Solve for i in: payment = P * i / (1 - (1+i)^-n) using binary search.
-    Returns monthly i.
-    """
+    """Solve i in: payment = P*i/(1-(1+i)^-n) using binary search."""
     if P <= 0 or n <= 0:
         return float("nan")
     if payment * n < P:
         return float("nan")
 
-    lo, hi = 0.0, 3.0  # 0% to 300% monthly
+    lo, hi = 0.0, 3.0
     for _ in range(80):
         mid = (lo + hi) / 2.0
         denom = 1.0 - (1.0 + mid) ** (-n)
@@ -126,9 +105,7 @@ def implied_monthly_rate_from_payment(P: float, payment: float, n: int) -> float
 
 
 def effective_apr_from_monthly(i: float) -> float:
-    """
-    Effective APR: (1+i)^12 - 1
-    """
+    """Effective APR = (1+i)^12 - 1"""
     if not np.isfinite(i):
         return float("nan")
     return float((1.0 + i) ** 12 - 1.0)
@@ -232,12 +209,6 @@ def ksh(x: float) -> str:
     return f"KSh {x:,.2f}"
 
 
-def pct(x: float) -> str:
-    if x is None or not np.isfinite(x):
-        return "—"
-    return f"{x*100:.2f}%"
-
-
 # ============================================================
 # PDF generator (ReportLab)
 # ============================================================
@@ -328,24 +299,18 @@ def build_pdf_report(
 
     # 3. RADCF Computation
     story.append(Paragraph("3. RADCF Pricing Computation (Core)", styles["H2x"]))
-
-    story.append(Paragraph("Step A: Compute revised cashflow requirement", styles["Body"]))
     story.append(Paragraph(
         f"CF_revised = OP + AdminCost − Deposit = {ksh(radcf['op'])} + {ksh(radcf['admin_cost_amount'])} − {ksh(radcf['deposit_amount'])} = <b>{ksh(radcf['cf_revised'])}</b>",
         styles["Body"]
     ))
     story.append(Spacer(1, 6))
-
-    story.append(Paragraph("Step B: Compute annuity factor", styles["Body"]))
     story.append(Paragraph(
         f"AF = (1 − (1+r)^(-n)) / r, where r={inputs['r_monthly']:.4f}, n={inputs['n_months']} → AF ≈ <b>{radcf['annuity_factor']:.4f}</b>",
         styles["Body"]
     ))
     story.append(Spacer(1, 6))
-
-    story.append(Paragraph("Step C: Compute fair monthly installment", styles["Body"]))
     story.append(Paragraph(
-        f"M = CF_revised / ((1−PD) * AF) = {ksh(radcf['cf_revised'])} / ({(1-pd_value):.3f} * {radcf['annuity_factor']:.4f}) → <b>{ksh(radcf['fair_monthly_installment'])}</b>",
+        f"M = CF_revised / ((1−PD) * AF) → <b>{ksh(radcf['fair_monthly_installment'])}</b>",
         styles["Body"]
     ))
     story.append(Spacer(1, 12))
@@ -367,7 +332,7 @@ def build_pdf_report(
     story.append(t3)
     story.append(Spacer(1, 12))
 
-    # 5. Market comparison (optional)
+    # 5. Market comparison
     story.append(Paragraph("5. Market Comparison (if provided)", styles["H2x"]))
     if market.get("provided"):
         mc_rows = [
@@ -378,9 +343,6 @@ def build_pdf_report(
             ["Fairness Score (0–100)", f'{market.get("fairness_score"):.1f}'],
             ["Assessment", f'{market.get("tag")} — {market.get("tag_explain")}'],
         ]
-        if np.isfinite(market.get("implied_apr", float("nan"))):
-            mc_rows.append(["Implied APR (effective)", f'{market["implied_apr"]*100:.1f}%'])
-
         t4 = Table(mc_rows, colWidths=[230, 270])
         t4.setStyle(TableStyle([
             ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
@@ -395,12 +357,9 @@ def build_pdf_report(
     # 6. Sensitivity analysis
     story.append(Paragraph("6. Sensitivity Analysis (Stress Test)", styles["H2x"]))
     if sensitivity_df is not None and len(sensitivity_df) > 0:
-        df = sensitivity_df.copy()
-        # keep it readable in PDF
         cols = ["Scenario", "PD", "Admin%", "r", "Fair Monthly (KSh)", "Fair Total (KSh)"]
-        df = df[cols]
-
-        table_data = [cols] + df.values.tolist()
+        dfp = sensitivity_df[cols].copy()
+        table_data = [cols] + dfp.values.tolist()
         t5 = Table(table_data, colWidths=[120, 50, 55, 45, 110, 110])
         t5.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
@@ -413,9 +372,8 @@ def build_pdf_report(
     else:
         story.append(Paragraph("Sensitivity table not available.", styles["Body"]))
     story.append(Spacer(1, 12))
-   
 
-    # 7. Conclusion
+    # Conclusion & assumptions
     story.append(Paragraph("7. Conclusion & Recommendation (Auto-generated)", styles["H2x"]))
     conclusion = (
         f"Based on the RADCF framework and the inputs provided, the actuarially fair repayment plan is: "
@@ -427,21 +385,17 @@ def build_pdf_report(
             f"The market deal was assessed as {market.get('tag')}. "
             f"Overpricing was {market.get('over_pct')*100:.2f}% relative to RADCF fair value. "
         )
-    conclusion += (
-        "For consumer protection purposes, large deviations above RADCF fair value may indicate potential overpricing. "
-        "Sensitivity results indicate which parameters most influence fair pricing."
-    )
+    conclusion += "Sensitivity results indicate which parameters most influence fair pricing."
     story.append(Paragraph(conclusion, styles["Body"]))
     story.append(Spacer(1, 12))
 
-    # 8. Assumptions
     story.append(Paragraph("8. Assumptions & Limitations", styles["H2x"]))
     assumptions = [
-        "PD model is an income-based proxy; real lenders may use richer behavioral and credit history data.",
+        "PD model is an income-based proxy; real lenders may use richer credit/behavioral data.",
         "PD is treated as constant across the repayment term (simplifying assumption).",
-        "No recovery after default is assumed (LGD ≈ 100%) unless the model is extended.",
-        "Fair total assumes full payment of installments; RADCF PV reflects expected PV after default adjustment.",
-        "Some vendors may subsidize products or bundle services, causing market prices to appear below fair value."
+        "No recovery after default is assumed (LGD ≈ 100%) unless extended.",
+        "Fair total assumes full payment; RADCF PV reflects expected PV after default adjustment.",
+        "Some vendors may subsidize products or bundle services, making market prices appear below fair value."
     ]
     for a in assumptions:
         story.append(Paragraph(f"• {a}", styles["Body"]))
@@ -519,14 +473,13 @@ with tabs[0]:
         lvl, expl = pd_bucket(pd_val)
         st.metric("Estimated PD", f"{pd_val:.3f}")
         st.caption(f"Risk Level: **{lvl}** — {expl}")
-
         st.metric("Fair monthly installment (KSh)", f"{res['fair_monthly_installment']:.2f}")
         st.metric("Deposit amount (KSh)", f"{res['deposit_amount']:.2f}")
         st.metric("Admin cost amount (KSh)", f"{res['admin_cost_amount']:.2f}")
         st.metric("Fair total paid (KSh)", f"{res['fair_total_paid_if_no_default']:.2f}")
         st.metric("RADCF PV (expected PV)", f"{res['radcf_present_value']:.2f}")
 
-    # Market comparison + PDF data
+    # Market comparison
     market_info = {"provided": False}
 
     with right:
@@ -578,7 +531,7 @@ with tabs[0]:
                 "implied_apr": float(implied_apr),
             }
 
-    # Sensitivity table (for PDF + UI)
+    # Sensitivity table
     st.divider()
     st.markdown("### Sensitivity Analysis (Stress Test)")
 
@@ -609,7 +562,56 @@ with tabs[0]:
     sens_df = pd.DataFrame(rows)
     st.dataframe(sens_df, use_container_width=True)
 
+    # Tornado chart (USES sens_df, NOT df)
+    st.markdown("### Tornado Chart (Sensitivity Impact vs Base)")
 
+    required_cols = {"Scenario", "Fair Total (KSh)", "Fair Monthly (KSh)"}
+    if sens_df is None or sens_df.empty or not required_cols.issubset(set(sens_df.columns)):
+        st.warning("Sensitivity table not available for tornado chart.")
+    else:
+        metric = st.radio(
+            "Show sensitivity for:",
+            options=["Fair Total (KSh)", "Fair Monthly (KSh)"],
+            horizontal=True,
+            index=0,
+            key="tornado_metric",
+        )
+
+        base_row = sens_df[sens_df["Scenario"] == "Base"]
+        if base_row.empty:
+            st.warning("Base scenario not found in sensitivity table.")
+        else:
+            base_val = float(base_row.iloc[0][metric])
+
+            plot_df = sens_df[sens_df["Scenario"] != "Base"].copy()
+            plot_df["Impact"] = plot_df[metric].astype(float) - base_val
+            plot_df["AbsImpact"] = plot_df["Impact"].abs()
+            plot_df = plot_df.sort_values("AbsImpact", ascending=True)
+
+            dec = plot_df[plot_df["Impact"] < 0]
+            inc = plot_df[plot_df["Impact"] > 0]
+
+            fig = go.Figure()
+            fig.add_trace(go.Bar(y=dec["Scenario"], x=dec["Impact"], orientation="h", name="Decrease vs Base"))
+            fig.add_trace(go.Bar(y=inc["Scenario"], x=inc["Impact"], orientation="h", name="Increase vs Base"))
+            fig.add_vline(x=0, line_width=1)
+
+            fig.update_layout(
+                barmode="relative",
+                height=420,
+                xaxis_title=f"Impact on {metric} (KSh)",
+                yaxis_title="Scenario",
+                title=f"Sensitivity Tornado Chart (Base = {base_val:,.2f} KSh)",
+                margin=dict(l=20, r=20, t=60, b=40),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+            most_sensitive = plot_df.iloc[-1]
+            st.caption(
+                f"Most sensitive factor: **{most_sensitive['Scenario']}** → {most_sensitive['Impact']:,.2f} KSh change from base."
+            )
 
     # PDF download (manual tab)
     st.divider()
@@ -638,7 +640,7 @@ with tabs[0]:
         data=pdf_bytes,
         file_name=f"RADCF_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
         mime="application/pdf",
-        key="dl_pdf_manual"
+        key="dl_pdf_manual",
     )
 
 
@@ -660,63 +662,24 @@ with tabs[1]:
     colX, colY = st.columns(2)
 
     with colX:
-        cash_price2 = st.number_input(
-            "Cash price (KSh)",
-            min_value=0.0,
-            value=float(extracted["cash_price"] or 25000.0),
-            step=500.0,
-            key="cp2"
-        )
-        n_months2 = st.number_input(
-            "Repayment term (months)",
-            min_value=1,
-            value=int(extracted["term_months"] or 12),
-            step=1,
-            key="n2"
-        )
-        income2 = st.number_input(
-            "Borrower monthly income (KSh)",
-            min_value=0.0,
-            value=30000.0,
-            step=1000.0,
-            key="inc2"
-        )
+        cash_price2 = st.number_input("Cash price (KSh)", min_value=0.0, value=float(extracted["cash_price"] or 25000.0), step=500.0, key="cp2")
+        n_months2 = st.number_input("Repayment term (months)", min_value=1, value=int(extracted["term_months"] or 12), step=1, key="n2")
+        income2 = st.number_input("Borrower monthly income (KSh)", min_value=0.0, value=30000.0, step=1000.0, key="inc2")
 
     with colY:
         dep_pct_guess = extracted["deposit_pct"]
         if dep_pct_guess is None and extracted["deposit_amount"] is not None and cash_price2 > 0:
             dep_pct_guess = 100.0 * float(extracted["deposit_amount"]) / float(cash_price2)
 
-        deposit_pct2 = st.number_input(
-            "Deposit (%)",
-            min_value=0.0,
-            max_value=100.0,
-            value=float(dep_pct_guess or 30.0),
-            step=1.0,
-            key="dp2"
-        )
+        deposit_pct2 = st.number_input("Deposit (%)", min_value=0.0, max_value=100.0, value=float(dep_pct_guess or 30.0), step=1.0, key="dp2")
 
         admin_pct_guess = extracted["admin_pct"]
         if admin_pct_guess is None and extracted["admin_amount"] is not None and cash_price2 > 0:
             admin_pct_guess = 100.0 * float(extracted["admin_amount"]) / float(cash_price2)
 
-        admin2 = st.number_input(
-            "Administrative cost (%)",
-            min_value=0.0,
-            max_value=30.0,
-            value=float(admin_pct_guess or 5.0),
-            step=0.5,
-            key="ad2"
-        )
+        admin2 = st.number_input("Administrative cost (%)", min_value=0.0, max_value=30.0, value=float(admin_pct_guess or 5.0), step=0.5, key="ad2")
 
-        r2 = st.number_input(
-            "Monthly discount rate r",
-            min_value=0.0,
-            value=0.02,
-            step=0.005,
-            format="%.3f",
-            key="r2"
-        )
+        r2 = st.number_input("Monthly discount rate r", min_value=0.0, value=0.02, step=0.005, format="%.3f", key="r2")
 
     st.markdown("**PD parameters**")
     colP1, colP2 = st.columns(2)
@@ -733,49 +696,10 @@ with tabs[1]:
     st.metric("Fair monthly installment (KSh)", f"{res2['fair_monthly_installment']:.2f}")
     st.metric("Fair total paid (KSh)", f"{res2['fair_total_paid_if_no_default']:.2f}")
 
-    # Market comparison from extracted monthly installment
-    market_info2 = {"provided": False}
-    sens_df2 = pd.DataFrame()
+    st.divider()
+    st.markdown("### Download Report")
 
-    if extracted["monthly_installment"] is not None:
-        market_m = float(extracted["monthly_installment"])
-        market_total_est = res2["deposit_amount"] + market_m * int(n_months2)
-
-        over_amt2 = market_total_est - res2["fair_total_paid_if_no_default"]
-        over_pct2 = (over_amt2 / res2["fair_total_paid_if_no_default"]) if res2["fair_total_paid_if_no_default"] > 0 else float("nan")
-
-        tag2, tag_explain2 = fairness_tag(over_pct2)
-        fairness_score2 = max(0.0, min(100.0, 100.0 - over_pct2 * 100.0))
-
-        principal_financed2 = cash_price2 - res2["deposit_amount"]
-        im2 = implied_monthly_rate_from_payment(principal_financed2, market_m, int(n_months2))
-        apr2 = effective_apr_from_monthly(im2)
-
-        st.divider()
-        st.markdown("### Market comparison (from extracted monthly installment)")
-        st.metric("Market monthly installment (KSh)", f"{market_m:.2f}")
-        st.metric("Estimated market total paid (KSh)", f"{market_total_est:.2f}")
-        st.metric("Overpricing amount (KSh)", f"{over_amt2:.2f}")
-        st.metric("Overpricing (%)", f"{over_pct2*100:.2f}%")
-        st.metric("Fairness Score (0–100)", f"{fairness_score2:.1f}")
-        st.caption(f"Assessment: **{tag2}** — {tag_explain2}")
-
-        if np.isfinite(apr2):
-            st.metric("Implied APR (effective)", f"{apr2*100:.1f}%")
-
-        market_info2 = {
-            "provided": True,
-            "market_monthly": float(market_m),
-            "market_total": float(market_total_est),
-            "over_amt": float(over_amt2),
-            "over_pct": float(over_pct2),
-            "fairness_score": float(fairness_score2),
-            "tag": tag2,
-            "tag_explain": tag_explain2,
-            "implied_apr": float(apr2),
-        }
-
-    # Build a small sensitivity table also in auto-fill mode (so PDF is complete)
+    # Build sensitivity in auto-fill mode too
     pd_low2 = max(0.0, pd2 * 0.9)
     pd_high2 = min(1.0, pd2 * 1.1)
     scenarios2 = [
@@ -799,9 +723,6 @@ with tabs[1]:
         })
     sens_df2 = pd.DataFrame(rows2)
 
-    st.divider()
-    st.markdown("### Download Report")
-
     pdf_bytes2 = build_pdf_report(
         report_title="Actuarial Evaluation of Consumer Overpricing in Kenya’s Hire-Purchase Market (RADCF Engine)",
         generated_dt=datetime.now(),
@@ -816,7 +737,7 @@ with tabs[1]:
         pd_params={"beta0": float(beta0_2), "beta1": float(beta1_2)},
         pd_value=float(pd2),
         radcf=res2,
-        market=market_info2,
+        market={"provided": False},
         sensitivity_df=sens_df2,
     )
 
@@ -825,7 +746,7 @@ with tabs[1]:
         data=pdf_bytes2,
         file_name=f"RADCF_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
         mime="application/pdf",
-        key="dl_pdf_autofill"
+        key="dl_pdf_autofill",
     )
 
     st.caption("Extraction is basic regex for now. Next step: upload images/PDFs + OCR.")
