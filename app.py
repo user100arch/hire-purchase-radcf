@@ -1,21 +1,33 @@
 import re
 import math
+import io
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ============================================================
-# Actuarial Hire-Purchase Fair Pricing + Transparency Tool
-# RADCF Core (Research Prototype)
-# ============================================================
+# PDF (ReportLab)
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    PageBreak,
+)
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
 
-# -----------------------------
+
+# ============================================================
 # Core actuarial/pricing functions
-# -----------------------------
+# ============================================================
 def logistic_pd(income_ksh: float, beta0: float, beta1: float) -> float:
     """
     PD = 1 / (1 + exp(-(beta0 + beta1 * ln(income/100))))
-    Clamps to [0,1]
+    Clamps to [0,1].
     """
     if income_ksh <= 0:
         return 1.0
@@ -46,16 +58,17 @@ def fair_installment(
     pd_est: float
 ) -> dict:
     """
-    RADCF-style structure (as per your dissertation draft):
-      OP = cash_price
-      Deposit = OP * deposit_pct
-      AdminCost = OP * admin_cost_pct
-      CF_revised = OP + AdminCost - Deposit
+    Consistent with your draft:
+    OP = cash_price
+    Deposit = OP * deposit_pct
+    Admin = OP * admin_cost_pct
+    CF_revised = OP + Admin - Deposit
+    AF = annuity_factor(r, n)
+    M = CF_revised / ((1 - PD) * AF)
 
-      M = CF_revised / ((1 - PD) * AF)
-
-    - "Fair total paid" assumes full payment (deposit + M*n)
-    - RADCF PV is expected PV after default-risk adjustment
+    Fair total assumes full payment (deposit + M*n)
+    RADCF PV is expected PV after default-risk adjustment:
+        PV = deposit + (M * AF * (1-PD))
     """
     op = float(cash_price)
     deposit = op * (deposit_pct / 100.0)
@@ -63,15 +76,15 @@ def fair_installment(
     cf_revised = op + admin_cost - deposit
 
     af = annuity_factor(r_monthly, int(n_months))
-    repay_prob = max(1e-9, (1.0 - float(pd_est)))  # avoid division by zero
+    repay_prob = max(1e-9, (1.0 - float(pd_est)))  # avoid divide-by-zero
 
     if af <= 0:
         m = float("nan")
     else:
         m = cf_revised / (repay_prob * af)
 
-    fair_total = deposit + (m * n_months)            # total if installments fully paid
-    radcf_pv = deposit + (m * af * repay_prob)       # expected PV of installments + deposit
+    fair_total = deposit + (m * n_months)
+    radcf_pv = deposit + (m * af * repay_prob)
 
     return {
         "op": op,
@@ -79,6 +92,7 @@ def fair_installment(
         "admin_cost_amount": admin_cost,
         "cf_revised": cf_revised,
         "annuity_factor": af,
+        "repay_prob": repay_prob,
         "fair_monthly_installment": m,
         "fair_total_paid_if_no_default": fair_total,
         "radcf_present_value": radcf_pv,
@@ -95,7 +109,7 @@ def implied_monthly_rate_from_payment(P: float, payment: float, n: int) -> float
     if payment * n < P:
         return float("nan")
 
-    lo, hi = 0.0, 3.0  # 0% to 300% monthly (wide enough)
+    lo, hi = 0.0, 3.0  # 0% to 300% monthly
     for _ in range(80):
         mid = (lo + hi) / 2.0
         denom = 1.0 - (1.0 + mid) ** (-n)
@@ -119,18 +133,18 @@ def effective_apr_from_monthly(i: float) -> float:
     return float((1.0 + i) ** 12 - 1.0)
 
 
-# -----------------------------
+# ============================================================
 # Simple text extraction (regex)
-# -----------------------------
+# ============================================================
 def extract_deal_fields(text: str) -> dict:
     """
-    Lightweight extraction from pasted text.
     Attempts to find:
       cash price, deposit (%/amount), term (months), monthly installment, admin fee (%/amount)
     """
-    t = (text or "").lower().replace(",", " ")
+    t = (text or "").lower()
+    t = t.replace(",", " ")
 
-    money = r"(?:ksh|kes)\s*([0-9]{3,})"
+    money = r"(?:ksh|kes)\s*([0-9]{2,})"
     pct = r"([0-9]{1,2}(?:\.[0-9]+)?)\s*%"
 
     # Cash price
@@ -143,7 +157,7 @@ def extract_deal_fields(text: str) -> dict:
         if m2:
             cash_price = float(m2.group(1))
 
-    # Deposit (% then amount)
+    # Deposit
     deposit_pct = None
     mdp = re.search(r"(deposit|downpayment|down payment)\s*[:\-]?\s*" + pct, t)
     if mdp:
@@ -188,29 +202,22 @@ def extract_deal_fields(text: str) -> dict:
     }
 
 
-# -----------------------------
-# Helper: interpret results
-# -----------------------------
-def pd_label(pd_val: float) -> tuple[str, str]:
-    """
-    Returns (label, explanation)
-    """
+# ============================================================
+# Interpretation helpers
+# ============================================================
+def pd_bucket(pd_val: float) -> tuple[str, str]:
     if pd_val >= 0.50:
-        return ("High", "Repayment risk is high; the fair installment increases to compensate expected default losses.")
+        return ("High", "High estimated repayment risk; fair installments increase to compensate expected default losses.")
     if pd_val >= 0.25:
-        return ("Moderate", "Repayment risk is moderate; pricing includes a meaningful credit-risk adjustment.")
-    return ("Low", "Repayment risk is low; pricing requires a smaller credit-risk adjustment.")
+        return ("Moderate", "Moderate repayment risk; pricing includes a meaningful credit-risk adjustment.")
+    return ("Low", "Low repayment risk; pricing requires a smaller credit-risk adjustment.")
 
 
-def fairness_badge(over_pct: float) -> tuple[str, str]:
-    """
-    over_pct > 0 means market is above fair.
-    over_pct < 0 means market is below fair.
-    """
+def fairness_tag(over_pct: float) -> tuple[str, str]:
     if not np.isfinite(over_pct):
         return ("", "")
     if over_pct >= 0.25:
-        return ("Severely Overpriced", "Market pricing is far above RADCF fair value (large risk/markup component).")
+        return ("Severely Overpriced", "Market pricing is far above RADCF fair value.")
     if over_pct >= 0.10:
         return ("Overpriced", "Market pricing is above RADCF fair value.")
     if over_pct >= -0.10:
@@ -218,26 +225,250 @@ def fairness_badge(over_pct: float) -> tuple[str, str]:
     return ("Below Fair", "Market pricing is below RADCF fair value (possible subsidy, promotion, or different risk structure).")
 
 
-# -----------------------------
+def ksh(x: float) -> str:
+    if x is None or not np.isfinite(x):
+        return "—"
+    return f"KSh {x:,.2f}"
+
+
+def pct(x: float) -> str:
+    if x is None or not np.isfinite(x):
+        return "—"
+    return f"{x*100:.2f}%"
+
+
+# ============================================================
+# PDF generator (ReportLab)
+# ============================================================
+def build_pdf_report(
+    report_title: str,
+    generated_dt: datetime,
+    inputs: dict,
+    pd_params: dict,
+    pd_value: float,
+    radcf: dict,
+    market: dict,
+    sensitivity_df: pd.DataFrame,
+) -> bytes:
+    buf = io.BytesIO()
+
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=36,
+        rightMargin=36,
+        topMargin=36,
+        bottomMargin=36,
+        title="RADCF Fair Pricing Report",
+        author="RADCF Pricing Engine",
+    )
+
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="H1x", parent=styles["Heading1"], fontSize=16, spaceAfter=10))
+    styles.add(ParagraphStyle(name="H2x", parent=styles["Heading2"], fontSize=12, spaceAfter=6))
+    styles.add(ParagraphStyle(name="Small", parent=styles["BodyText"], fontSize=9, leading=12))
+    styles.add(ParagraphStyle(name="Body", parent=styles["BodyText"], fontSize=10, leading=14))
+
+    story = []
+
+    # Header
+    story.append(Paragraph("RADCF Fair Pricing Report", styles["H1x"]))
+    story.append(Paragraph(report_title, styles["Body"]))
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(f"Generated: {generated_dt.strftime('%Y-%m-%d %H:%M:%S')} (EAT)", styles["Small"]))
+    story.append(Paragraph(f"Report ID: RADCF-{generated_dt.strftime('%Y%m%d-%H%M%S')}", styles["Small"]))
+    story.append(Spacer(1, 12))
+
+    # 1. Contract Summary
+    story.append(Paragraph("1. Contract Summary (Inputs)", styles["H2x"]))
+    input_rows = [
+        ["Cash Price (OP)", ksh(inputs["cash_price"])],
+        ["Repayment Term", f'{inputs["n_months"]} months'],
+        ["Deposit", f'{inputs["deposit_pct"]:.2f}%  →  {ksh(radcf["deposit_amount"])}'],
+        ["Admin Cost", f'{inputs["admin_cost_pct"]:.2f}%  →  {ksh(radcf["admin_cost_amount"])}'],
+        ["Monthly Discount Rate r", f'{inputs["r_monthly"]:.4f}  ({inputs["r_monthly"]*100:.2f}% per month)'],
+        ["Borrower Monthly Income", ksh(inputs["income_ksh"])],
+    ]
+    t1 = Table(input_rows, colWidths=[180, 320])
+    t1.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, colors.Color(0.98, 0.98, 0.98)]),
+    ]))
+    story.append(t1)
+    story.append(Spacer(1, 12))
+
+    # 2. Risk Model
+    story.append(Paragraph("2. Risk Model (PD Estimation)", styles["H2x"]))
+    pd_level, pd_explain = pd_bucket(pd_value)
+    story.append(Paragraph(
+        "PD model form (logistic): PD = 1 / (1 + exp(-(β0 + β1 * ln(income/100))))",
+        styles["Body"]
+    ))
+    story.append(Spacer(1, 6))
+
+    pd_rows = [
+        ["β0", f'{pd_params["beta0"]:.2f}'],
+        ["β1", f'{pd_params["beta1"]:.2f}'],
+        ["Estimated PD", f"{pd_value:.3f}"],
+        ["Risk Interpretation", f"{pd_level} — {pd_explain}"],
+    ]
+    t2 = Table(pd_rows, colWidths=[180, 320])
+    t2.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, colors.Color(0.98, 0.98, 0.98)]),
+    ]))
+    story.append(t2)
+    story.append(Spacer(1, 12))
+
+    # 3. RADCF Computation
+    story.append(Paragraph("3. RADCF Pricing Computation (Core)", styles["H2x"]))
+
+    story.append(Paragraph("Step A: Compute revised cashflow requirement", styles["Body"]))
+    story.append(Paragraph(
+        f"CF_revised = OP + AdminCost − Deposit = {ksh(radcf['op'])} + {ksh(radcf['admin_cost_amount'])} − {ksh(radcf['deposit_amount'])} = <b>{ksh(radcf['cf_revised'])}</b>",
+        styles["Body"]
+    ))
+    story.append(Spacer(1, 6))
+
+    story.append(Paragraph("Step B: Compute annuity factor", styles["Body"]))
+    story.append(Paragraph(
+        f"AF = (1 − (1+r)^(-n)) / r, where r={inputs['r_monthly']:.4f}, n={inputs['n_months']} → AF ≈ <b>{radcf['annuity_factor']:.4f}</b>",
+        styles["Body"]
+    ))
+    story.append(Spacer(1, 6))
+
+    story.append(Paragraph("Step C: Compute fair monthly installment", styles["Body"]))
+    story.append(Paragraph(
+        f"M = CF_revised / ((1−PD) * AF) = {ksh(radcf['cf_revised'])} / ({(1-pd_value):.3f} * {radcf['annuity_factor']:.4f}) → <b>{ksh(radcf['fair_monthly_installment'])}</b>",
+        styles["Body"]
+    ))
+    story.append(Spacer(1, 12))
+
+    # 4. Outputs
+    story.append(Paragraph("4. Fair Price Outputs (Main Results)", styles["H2x"]))
+    out_rows = [
+        ["Deposit", ksh(radcf["deposit_amount"])],
+        ["Fair Monthly Installment (M)", ksh(radcf["fair_monthly_installment"])],
+        ["Fair Total Paid (Deposit + M*n)", ksh(radcf["fair_total_paid_if_no_default"])],
+        ["RADCF Present Value (expected PV)", ksh(radcf["radcf_present_value"])],
+    ]
+    t3 = Table(out_rows, colWidths=[230, 270])
+    t3.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, colors.Color(0.98, 0.98, 0.98)]),
+    ]))
+    story.append(t3)
+    story.append(Spacer(1, 12))
+
+    # 5. Market comparison (optional)
+    story.append(Paragraph("5. Market Comparison (if provided)", styles["H2x"]))
+    if market.get("provided"):
+        mc_rows = [
+            ["Market Monthly Installment", ksh(market.get("market_monthly"))],
+            ["Market Total Repayment", ksh(market.get("market_total"))],
+            ["Overpricing Amount", ksh(market.get("over_amt"))],
+            ["Overpricing (%)", f'{market.get("over_pct")*100:.2f}%'],
+            ["Fairness Score (0–100)", f'{market.get("fairness_score"):.1f}'],
+            ["Assessment", f'{market.get("tag")} — {market.get("tag_explain")}'],
+        ]
+        if np.isfinite(market.get("implied_apr", float("nan"))):
+            mc_rows.append(["Implied APR (effective)", f'{market["implied_apr"]*100:.1f}%'])
+
+        t4 = Table(mc_rows, colWidths=[230, 270])
+        t4.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, colors.Color(0.98, 0.98, 0.98)]),
+        ]))
+        story.append(t4)
+    else:
+        story.append(Paragraph("No market comparison values were provided in this run.", styles["Body"]))
+    story.append(Spacer(1, 12))
+
+    # 6. Sensitivity analysis
+    story.append(Paragraph("6. Sensitivity Analysis (Stress Test)", styles["H2x"]))
+    if sensitivity_df is not None and len(sensitivity_df) > 0:
+        df = sensitivity_df.copy()
+        # keep it readable in PDF
+        cols = ["Scenario", "PD", "Admin%", "r", "Fair Monthly (KSh)", "Fair Total (KSh)"]
+        df = df[cols]
+
+        table_data = [cols] + df.values.tolist()
+        t5 = Table(table_data, colWidths=[120, 50, 55, 45, 110, 110])
+        t5.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        story.append(t5)
+    else:
+        story.append(Paragraph("Sensitivity table not available.", styles["Body"]))
+    story.append(Spacer(1, 12))
+
+    # 7. Conclusion
+    story.append(Paragraph("7. Conclusion & Recommendation (Auto-generated)", styles["H2x"]))
+    conclusion = (
+        f"Based on the RADCF framework and the inputs provided, the actuarially fair repayment plan is: "
+        f"Deposit {ksh(radcf['deposit_amount'])}, monthly installment {ksh(radcf['fair_monthly_installment'])}, "
+        f"and fair total {ksh(radcf['fair_total_paid_if_no_default'])}. "
+    )
+    if market.get("provided"):
+        conclusion += (
+            f"The market deal was assessed as {market.get('tag')}. "
+            f"Overpricing was {market.get('over_pct')*100:.2f}% relative to RADCF fair value. "
+        )
+    conclusion += (
+        "For consumer protection purposes, large deviations above RADCF fair value may indicate potential overpricing. "
+        "Sensitivity results indicate which parameters most influence fair pricing."
+    )
+    story.append(Paragraph(conclusion, styles["Body"]))
+    story.append(Spacer(1, 12))
+
+    # 8. Assumptions
+    story.append(Paragraph("8. Assumptions & Limitations", styles["H2x"]))
+    assumptions = [
+        "PD model is an income-based proxy; real lenders may use richer behavioral and credit history data.",
+        "PD is treated as constant across the repayment term (simplifying assumption).",
+        "No recovery after default is assumed (LGD ≈ 100%) unless the model is extended.",
+        "Fair total assumes full payment of installments; RADCF PV reflects expected PV after default adjustment.",
+        "Some vendors may subsidize products or bundle services, causing market prices to appear below fair value."
+    ]
+    for a in assumptions:
+        story.append(Paragraph(f"• {a}", styles["Body"]))
+    story.append(Spacer(1, 6))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+# ============================================================
 # Streamlit UI
-# -----------------------------
+# ============================================================
 st.set_page_config(page_title="RADCF Fair Pricing Engine", layout="wide")
 
 st.title("Actuarial Evaluation of Consumer Overpricing in Kenya’s Hire-Purchase Market")
 st.markdown("### Risk-Adjusted Discounted Cash Flow (RADCF) Pricing Engine")
 
-with st.expander("Model Overview (What this tool does)", expanded=True):
+with st.expander("Model Overview", expanded=True):
     st.markdown(
         """
 This tool estimates an **actuarially fair** hire-purchase repayment plan using a **Risk-Adjusted Discounted Cash Flow (RADCF)** approach.
 
 **Workflow**
-1. Estimate **Probability of Default (PD)** via a logistic model (income-based).
-2. Adjust expected repayments using *(1 − PD)*.
-3. Discount expected cashflows using a monthly discount rate *r*.
-4. Incorporate **deposit** and **administrative cost** assumptions.
+1. Estimate **Probability of Default (PD)** via a logistic model (income-based proxy).
+2. Adjust repayments using *(1 − PD)*.
+3. Discount expected cashflows using monthly discount rate *r*.
+4. Include deposit and administrative cost assumptions.
 
-Use this tool to compare a market hire-purchase deal against the RADCF fair value.
+Use the **Market Deal Comparison** section to estimate overpricing and generate a formal PDF report.
         """
     )
 
@@ -246,7 +477,6 @@ with st.expander("Mathematical Framework (Formulas)", expanded=False):
     st.latex(r"AF = \frac{1-(1+r)^{-n}}{r}")
     st.latex(r"CF_{revised} = OP + \text{AdminCost} - \text{Deposit}")
     st.latex(r"M = \frac{CF_{revised}}{(1-PD)\cdot AF}")
-    st.caption("Where OP is the cash price, Deposit and AdminCost are computed as percentages of OP.")
 
 tabs = st.tabs(["Manual Calculator", "Paste Contract Text (Auto-fill)"])
 
@@ -257,91 +487,98 @@ tabs = st.tabs(["Manual Calculator", "Paste Contract Text (Auto-fill)"])
 with tabs[0]:
     st.subheader("Manual RADCF Calculator")
 
-    st.markdown("#### Step 1: Enter Contract Terms and Risk Inputs")
     colA, colB, colC = st.columns(3)
 
     with colA:
-        cash_price = st.number_input("Cash price (KSh)", min_value=0.0, value=25000.0, step=500.0)
-        n_months = st.number_input("Repayment term (months)", min_value=1, value=12, step=1)
-        income_ksh = st.number_input("Borrower monthly income (KSh)", min_value=0.0, value=30000.0, step=1000.0)
+        cash_price = st.number_input("Cash price (KSh)", min_value=0.0, value=25000.0, step=500.0, key="cp1")
+        n_months = st.number_input("Repayment term (months)", min_value=1, value=12, step=1, key="n1")
+        income_ksh = st.number_input("Borrower monthly income (KSh)", min_value=0.0, value=30000.0, step=1000.0, key="inc1")
 
     with colB:
-        deposit_pct = st.number_input("Deposit (%)", min_value=0.0, max_value=100.0, value=30.0, step=1.0)
-        admin_cost_pct = st.number_input("Administrative cost (%)", min_value=0.0, max_value=30.0, value=5.0, step=0.5)
-        r_monthly = st.number_input(
-            "Monthly discount rate r (e.g. 0.02 = 2%)",
-            min_value=0.0,
-            value=0.02,
-            step=0.005,
-            format="%.3f",
-        )
+        deposit_pct = st.number_input("Deposit (%)", min_value=0.0, max_value=100.0, value=30.0, step=1.0, key="dp1")
+        admin_cost_pct = st.number_input("Administrative cost (%)", min_value=0.0, max_value=30.0, value=5.0, step=0.5, key="ad1")
+        r_monthly = st.number_input("Monthly discount rate r (e.g. 0.02 = 2%)",
+                                    min_value=0.0, value=0.02, step=0.005, format="%.3f", key="r1")
 
     with colC:
-        st.markdown("**PD Model Parameters**")
-        beta0 = st.number_input("β0", value=2.5, step=0.1, format="%.2f")
-        beta1 = st.number_input("β1", value=-0.4, step=0.05, format="%.2f")
+        st.markdown("**PD model parameters**")
+        beta0 = st.number_input("β0", value=2.5, step=0.1, format="%.2f", key="b01")
+        beta1 = st.number_input("β1", value=-0.4, step=0.05, format="%.2f", key="b11")
 
     pd_val = logistic_pd(income_ksh, beta0, beta1)
     res = fair_installment(cash_price, deposit_pct, admin_cost_pct, int(n_months), float(r_monthly), pd_val)
 
     st.divider()
-    st.markdown("#### Step 2: RADCF Fair Pricing Results")
-
-    pd_class, pd_explain = pd_label(pd_val)
 
     left, right = st.columns([1.1, 0.9])
 
     with left:
         st.markdown("### Fair Pricing Outputs")
+        lvl, expl = pd_bucket(pd_val)
         st.metric("Estimated PD", f"{pd_val:.3f}")
-        st.caption(f"Risk Level: **{pd_class}** — {pd_explain}")
+        st.caption(f"Risk Level: **{lvl}** — {expl}")
 
         st.metric("Fair monthly installment (KSh)", f"{res['fair_monthly_installment']:.2f}")
         st.metric("Deposit amount (KSh)", f"{res['deposit_amount']:.2f}")
-        st.metric("Administrative cost amount (KSh)", f"{res['admin_cost_amount']:.2f}")
-        st.metric("Fair total paid (deposit + installments) (KSh)", f"{res['fair_total_paid_if_no_default']:.2f}")
+        st.metric("Admin cost amount (KSh)", f"{res['admin_cost_amount']:.2f}")
+        st.metric("Fair total paid (KSh)", f"{res['fair_total_paid_if_no_default']:.2f}")
+        st.metric("RADCF PV (expected PV)", f"{res['radcf_present_value']:.2f}")
 
-        # Fairness score when market comparison is provided (shown later)
-        st.caption("Fair total assumes full payment. RADCF PV is expected PV after default-risk adjustment.")
+    # Market comparison + PDF data
+    market_info = {"provided": False}
 
     with right:
-        st.markdown("### Market Deal Comparison (Optional)")
-        st.write("If you have a market deal, enter monthly installment or total repayment to estimate overpricing.")
-        market_monthly = st.number_input("Market monthly installment (KSh)", min_value=0.0, value=0.0, step=100.0)
-        market_total = st.number_input("Market total repayment (KSh)", min_value=0.0, value=0.0, step=500.0)
+        st.markdown("### Market Deal Comparison (optional)")
+        market_monthly = st.number_input("Market monthly installment (KSh)", min_value=0.0, value=0.0, step=100.0, key="m_m1")
+        market_total = st.number_input("Market total repayment (KSh)", min_value=0.0, value=0.0, step=500.0, key="m_t1")
 
         fair_total = res["fair_total_paid_if_no_default"]
-        over_pct = float("nan")
+
         over_amt = float("nan")
+        over_pct = float("nan")
         implied_apr = float("nan")
+        mkt_total_used = 0.0
 
         if market_total > 0:
-            over_amt = market_total - fair_total
+            mkt_total_used = float(market_total)
+            over_amt = mkt_total_used - fair_total
             over_pct = (over_amt / fair_total) if fair_total > 0 else float("nan")
-
         elif market_monthly > 0:
-            market_total_est = res["deposit_amount"] + market_monthly * int(n_months)
-            over_amt = market_total_est - fair_total
+            mkt_total_used = res["deposit_amount"] + float(market_monthly) * int(n_months)
+            over_amt = mkt_total_used - fair_total
             over_pct = (over_amt / fair_total) if fair_total > 0 else float("nan")
 
             principal_financed = cash_price - res["deposit_amount"]
-            im = implied_monthly_rate_from_payment(principal_financed, market_monthly, int(n_months))
+            im = implied_monthly_rate_from_payment(principal_financed, float(market_monthly), int(n_months))
             implied_apr = effective_apr_from_monthly(im)
 
         if np.isfinite(over_pct):
-            label, explain = fairness_badge(over_pct)
-            fairness_score = max(0.0, min(100.0, 100.0 - (over_pct * 100.0)))
+            tag, tag_explain = fairness_tag(over_pct)
+            fairness_score = max(0.0, min(100.0, 100.0 - over_pct * 100.0))
 
             st.metric("Overpricing amount (KSh)", f"{over_amt:.2f}")
             st.metric("Overpricing (%)", f"{over_pct*100:.2f}%")
             st.metric("Fairness Score (0–100)", f"{fairness_score:.1f}")
-            st.caption(f"Assessment: **{label}** — {explain}")
+            st.caption(f"Assessment: **{tag}** — {tag_explain}")
 
             if np.isfinite(implied_apr):
                 st.metric("Implied APR (effective)", f"{implied_apr*100:.1f}%")
 
+            market_info = {
+                "provided": True,
+                "market_monthly": float(market_monthly) if market_monthly > 0 else float("nan"),
+                "market_total": float(mkt_total_used),
+                "over_amt": float(over_amt),
+                "over_pct": float(over_pct),
+                "fairness_score": float(fairness_score),
+                "tag": tag,
+                "tag_explain": tag_explain,
+                "implied_apr": float(implied_apr),
+            }
+
+    # Sensitivity table (for PDF + UI)
     st.divider()
-    st.markdown("#### Sensitivity Analysis (Stress Test)")
+    st.markdown("### Sensitivity Analysis (Stress Test)")
 
     pd_low = max(0.0, pd_val * 0.9)
     pd_high = min(1.0, pd_val * 1.1)
@@ -367,35 +604,55 @@ with tabs[0]:
             "Fair Total (KSh)": round(rr["fair_total_paid_if_no_default"], 2),
         })
 
-    df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True)
+    sens_df = pd.DataFrame(rows)
+    st.dataframe(sens_df, use_container_width=True)
 
-    with st.expander("Policy / Practical Insight", expanded=False):
-        st.markdown(
-            """
-**Interpretation for stakeholders**
-- If the market total repayment is consistently above RADCF fair value, this indicates potential consumer overpricing.
-- Sensitivity analysis highlights which assumptions (PD, costs, discount rate) most influence fair pricing.
-- This framework can support consumer protection, financial literacy, and risk-based credit pricing discussions.
-            """
-        )
+    # PDF download (manual tab)
+    st.divider()
+    st.markdown("### Download Report")
+
+    pdf_bytes = build_pdf_report(
+        report_title="Actuarial Evaluation of Consumer Overpricing in Kenya’s Hire-Purchase Market (RADCF Engine)",
+        generated_dt=datetime.now(),
+        inputs={
+            "cash_price": cash_price,
+            "n_months": int(n_months),
+            "deposit_pct": float(deposit_pct),
+            "admin_cost_pct": float(admin_cost_pct),
+            "r_monthly": float(r_monthly),
+            "income_ksh": float(income_ksh),
+        },
+        pd_params={"beta0": float(beta0), "beta1": float(beta1)},
+        pd_value=float(pd_val),
+        radcf=res,
+        market=market_info,
+        sensitivity_df=sens_df,
+    )
+
+    st.download_button(
+        label="Download RADCF Report (PDF)",
+        data=pdf_bytes,
+        file_name=f"RADCF_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+        mime="application/pdf",
+        key="dl_pdf_manual"
+    )
+
 
 # ============================================================
 # TAB 2: Paste Contract Text (Auto-fill)
 # ============================================================
 with tabs[1]:
     st.subheader("Paste Contract / Offer Text → Auto-fill")
-    st.write("Paste a hire-purchase offer (WhatsApp message, advert text). The tool will attempt to extract contract terms and compute RADCF fair value.")
+    st.write("Paste a hire-purchase offer (WhatsApp message, advert text). We'll extract fields and compute RADCF fair price.")
 
     sample = "Cash price: KSh 25000. Deposit 30%. Pay KES 2500 per month for 12 months. Admin fee 5%."
     txt = st.text_area("Paste text here", value=sample, height=140, key="txt_offer")
 
     extracted = extract_deal_fields(txt)
-
-    st.markdown("### Extracted Contract Parameters (Auto-detected)")
+    st.markdown("### Extracted (best guesses)")
     st.json(extracted)
 
-    st.markdown("### Review / Edit Extracted Inputs")
+    st.markdown("### Auto-filled calculator")
     colX, colY = st.columns(2)
 
     with colX:
@@ -457,7 +714,7 @@ with tabs[1]:
             key="r2"
         )
 
-    st.markdown("**PD Model Parameters**")
+    st.markdown("**PD parameters**")
     colP1, colP2 = st.columns(2)
     with colP1:
         beta0_2 = st.number_input("β0", value=2.5, step=0.1, format="%.2f", key="b02")
@@ -468,39 +725,103 @@ with tabs[1]:
     res2 = fair_installment(cash_price2, deposit_pct2, admin2, int(n_months2), float(r2), pd2)
 
     st.divider()
-    st.markdown("### RADCF Results (Auto-fill Mode)")
-
-    pd_class2, pd_explain2 = pd_label(pd2)
     st.metric("Estimated PD", f"{pd2:.3f}")
-    st.caption(f"Risk Level: **{pd_class2}** — {pd_explain2}")
-
     st.metric("Fair monthly installment (KSh)", f"{res2['fair_monthly_installment']:.2f}")
-    st.metric("Fair total paid (deposit + installments) (KSh)", f"{res2['fair_total_paid_if_no_default']:.2f}")
+    st.metric("Fair total paid (KSh)", f"{res2['fair_total_paid_if_no_default']:.2f}")
+
+    # Market comparison from extracted monthly installment
+    market_info2 = {"provided": False}
+    sens_df2 = pd.DataFrame()
 
     if extracted["monthly_installment"] is not None:
         market_m = float(extracted["monthly_installment"])
-        market_total = res2["deposit_amount"] + market_m * int(n_months2)
+        market_total_est = res2["deposit_amount"] + market_m * int(n_months2)
 
-        over_amt2 = market_total - res2["fair_total_paid_if_no_default"]
+        over_amt2 = market_total_est - res2["fair_total_paid_if_no_default"]
         over_pct2 = (over_amt2 / res2["fair_total_paid_if_no_default"]) if res2["fair_total_paid_if_no_default"] > 0 else float("nan")
 
+        tag2, tag_explain2 = fairness_tag(over_pct2)
+        fairness_score2 = max(0.0, min(100.0, 100.0 - over_pct2 * 100.0))
+
+        principal_financed2 = cash_price2 - res2["deposit_amount"]
+        im2 = implied_monthly_rate_from_payment(principal_financed2, market_m, int(n_months2))
+        apr2 = effective_apr_from_monthly(im2)
+
         st.divider()
-        st.markdown("### Market Comparison (from extracted monthly installment)")
-
-        label2, explain2 = fairness_badge(over_pct2)
-        fairness_score2 = max(0.0, min(100.0, 100.0 - (over_pct2 * 100.0)))
-
+        st.markdown("### Market comparison (from extracted monthly installment)")
         st.metric("Market monthly installment (KSh)", f"{market_m:.2f}")
-        st.metric("Estimated market total paid (KSh)", f"{market_total:.2f}")
+        st.metric("Estimated market total paid (KSh)", f"{market_total_est:.2f}")
         st.metric("Overpricing amount (KSh)", f"{over_amt2:.2f}")
         st.metric("Overpricing (%)", f"{over_pct2*100:.2f}%")
         st.metric("Fairness Score (0–100)", f"{fairness_score2:.1f}")
-        st.caption(f"Assessment: **{label2}** — {explain2}")
+        st.caption(f"Assessment: **{tag2}** — {tag_explain2}")
 
-        principal_financed = cash_price2 - res2["deposit_amount"]
-        im = implied_monthly_rate_from_payment(principal_financed, market_m, int(n_months2))
-        apr = effective_apr_from_monthly(im)
-        if np.isfinite(apr):
-            st.metric("Implied APR (effective)", f"{apr*100:.1f}%")
+        if np.isfinite(apr2):
+            st.metric("Implied APR (effective)", f"{apr2*100:.1f}%")
 
-    st.caption("Note: Text extraction is regex-based for this prototype. It can be improved further using OCR and structured templates.")
+        market_info2 = {
+            "provided": True,
+            "market_monthly": float(market_m),
+            "market_total": float(market_total_est),
+            "over_amt": float(over_amt2),
+            "over_pct": float(over_pct2),
+            "fairness_score": float(fairness_score2),
+            "tag": tag2,
+            "tag_explain": tag_explain2,
+            "implied_apr": float(apr2),
+        }
+
+    # Build a small sensitivity table also in auto-fill mode (so PDF is complete)
+    pd_low2 = max(0.0, pd2 * 0.9)
+    pd_high2 = min(1.0, pd2 * 1.1)
+    scenarios2 = [
+        ("Base", pd2, admin2, r2),
+        ("PD -10%", pd_low2, admin2, r2),
+        ("PD +10%", pd_high2, admin2, r2),
+        ("Admin 8%", pd2, 8.0, r2),
+        ("r +2pp", pd2, admin2, r2 + 0.02),
+        ("r -1pp", pd2, admin2, max(0.0, r2 - 0.01)),
+    ]
+    rows2 = []
+    for name, pd_s, admin_s, r_s in scenarios2:
+        rr = fair_installment(cash_price2, deposit_pct2, admin_s, int(n_months2), float(r_s), float(pd_s))
+        rows2.append({
+            "Scenario": name,
+            "PD": round(float(pd_s), 3),
+            "Admin%": float(admin_s),
+            "r": round(float(r_s), 3),
+            "Fair Monthly (KSh)": round(rr["fair_monthly_installment"], 2),
+            "Fair Total (KSh)": round(rr["fair_total_paid_if_no_default"], 2),
+        })
+    sens_df2 = pd.DataFrame(rows2)
+
+    st.divider()
+    st.markdown("### Download Report")
+
+    pdf_bytes2 = build_pdf_report(
+        report_title="Actuarial Evaluation of Consumer Overpricing in Kenya’s Hire-Purchase Market (RADCF Engine)",
+        generated_dt=datetime.now(),
+        inputs={
+            "cash_price": float(cash_price2),
+            "n_months": int(n_months2),
+            "deposit_pct": float(deposit_pct2),
+            "admin_cost_pct": float(admin2),
+            "r_monthly": float(r2),
+            "income_ksh": float(income2),
+        },
+        pd_params={"beta0": float(beta0_2), "beta1": float(beta1_2)},
+        pd_value=float(pd2),
+        radcf=res2,
+        market=market_info2,
+        sensitivity_df=sens_df2,
+    )
+
+    st.download_button(
+        label="Download RADCF Report (PDF)",
+        data=pdf_bytes2,
+        file_name=f"RADCF_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+        mime="application/pdf",
+        key="dl_pdf_autofill"
+    )
+
+    st.caption("Extraction is basic regex for now. Next step: upload images/PDFs + OCR.")
