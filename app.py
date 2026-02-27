@@ -609,86 +609,82 @@ with tabs[0]:
     sens_df = pd.DataFrame(rows)
     st.dataframe(sens_df, use_container_width=True)
 
-    # -----------------------------
+ # -----------------------------
 # Tornado chart (Sensitivity visualization)
 # -----------------------------
 st.markdown("### Tornado Chart (Sensitivity Impact vs Base)")
 
-# Make sure the expected columns exist
-required_cols = {"Scenario", "Fair Total (KSh)", "Fair Monthly (KSh)"}
-if not required_cols.issubset(df.columns):
-    st.warning("Sensitivity table is missing expected columns for tornado chart.")
+# Defensive: ensure df exists and is a DataFrame
+if "df" not in locals() or df is None or not isinstance(df, pd.DataFrame):
+    st.warning("Sensitivity table not available for tornado chart.")
 else:
-    # Choose which metric to visualize
-    metric = st.radio(
-        "Show sensitivity for:",
-        options=["Fair Total (KSh)", "Fair Monthly (KSh)"],
-        horizontal=True,
-        index=0,
-        key="tornado_metric"
-    )
+    required_cols = {"Scenario", "Fair Total (KSh)", "Fair Monthly (KSh)"}
 
-    # Get base value
-    base_row = df[df["Scenario"] == "Base"]
-    if base_row.empty:
-        st.warning("Base scenario not found in sensitivity table.")
+    if not required_cols.issubset(set(df.columns)):
+        st.warning(
+            f"Missing columns for tornado chart. Required: {sorted(required_cols)}. "
+            f"Found: {list(df.columns)}"
+        )
     else:
-        base_val = float(base_row.iloc[0][metric])
-
-        # Compute impacts (difference from base)
-        plot_df = df.copy()
-        plot_df["Impact"] = plot_df[metric].astype(float) - base_val
-
-        # Exclude "Base" from chart bars (optional)
-        plot_df = plot_df[plot_df["Scenario"] != "Base"].copy()
-
-        # Sort by absolute impact (tornado style)
-        plot_df["AbsImpact"] = plot_df["Impact"].abs()
-        plot_df = plot_df.sort_values("AbsImpact", ascending=True)
-
-        # Split into decreases and increases for coloring/legend
-        dec = plot_df[plot_df["Impact"] < 0]
-        inc = plot_df[plot_df["Impact"] > 0]
-
-        fig = go.Figure()
-
-        # Negative impacts (left)
-        fig.add_trace(go.Bar(
-            y=dec["Scenario"],
-            x=dec["Impact"],
-            orientation="h",
-            name="Decrease vs Base"
-        ))
-
-        # Positive impacts (right)
-        fig.add_trace(go.Bar(
-            y=inc["Scenario"],
-            x=inc["Impact"],
-            orientation="h",
-            name="Increase vs Base"
-        ))
-
-        fig.update_layout(
-            barmode="relative",
-            height=420,
-            xaxis_title=f"Impact on {metric} (KSh)",
-            yaxis_title="Scenario",
-            title=f"Sensitivity Tornado Chart (Base = {base_val:,.2f} KSh)",
-            margin=dict(l=20, r=20, t=60, b=40),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        metric = st.radio(
+            "Show sensitivity for:",
+            options=["Fair Total (KSh)", "Fair Monthly (KSh)"],
+            horizontal=True,
+            index=0,
+            key="tornado_metric"
         )
 
-        # Add a vertical zero line (visual base reference)
-        fig.add_vline(x=0, line_width=1)
+        base_row = df[df["Scenario"] == "Base"]
+        if base_row.empty:
+            st.warning("Base scenario not found in sensitivity table.")
+        else:
+            base_val = float(base_row.iloc[0][metric])
 
-        st.plotly_chart(fig, use_container_width=True)
+            plot_df = df.copy()
+            plot_df["Impact"] = plot_df[metric].astype(float) - base_val
+            plot_df = plot_df[plot_df["Scenario"] != "Base"].copy()
 
-        # Quick interpretation (auto)
-        most_sensitive = plot_df.iloc[-1]
-        st.caption(
-            f"Most sensitive factor (by absolute impact): **{most_sensitive['Scenario']}** "
-            f"→ {most_sensitive['Impact']:,.2f} KSh change from base."
-        )
+            plot_df["AbsImpact"] = plot_df["Impact"].abs()
+            plot_df = plot_df.sort_values("AbsImpact", ascending=True)
+
+            dec = plot_df[plot_df["Impact"] < 0]
+            inc = plot_df[plot_df["Impact"] > 0]
+
+            fig = go.Figure()
+
+            fig.add_trace(go.Bar(
+                y=dec["Scenario"],
+                x=dec["Impact"],
+                orientation="h",
+                name="Decrease vs Base"
+            ))
+
+            fig.add_trace(go.Bar(
+                y=inc["Scenario"],
+                x=inc["Impact"],
+                orientation="h",
+                name="Increase vs Base"
+            ))
+
+            fig.update_layout(
+                barmode="relative",
+                height=420,
+                xaxis_title=f"Impact on {metric} (KSh)",
+                yaxis_title="Scenario",
+                title=f"Sensitivity Tornado Chart (Base = {base_val:,.2f} KSh)",
+                margin=dict(l=20, r=20, t=60, b=40),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+
+            fig.add_vline(x=0, line_width=1)
+
+            st.plotly_chart(fig, use_container_width=True)
+
+            most_sensitive = plot_df.iloc[-1]
+            st.caption(
+                f"Most sensitive factor: **{most_sensitive['Scenario']}** "
+                f"→ {most_sensitive['Impact']:,.2f} KSh change from base."
+            )
 
     # PDF download (manual tab)
     st.divider()
